@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
-	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 	"github.com/nyaruka/ezconf"
 	"github.com/nyaruka/gocommon/aws/cwatch"
@@ -18,6 +17,7 @@ import (
 	"github.com/nyaruka/rp-archiver/runtime"
 	slogmulti "github.com/samber/slog-multi"
 	slogsentry "github.com/samber/slog-sentry/v2"
+	"github.com/vinovest/sqlx"
 )
 
 var (
@@ -30,10 +30,6 @@ func main() {
 	config := runtime.NewDefaultConfig()
 	loader := ezconf.NewLoader(&config, "archiver", "Archives RapidPro runs and msgs to S3", []string{"archiver.toml"})
 	loader.MustLoad()
-
-	if config.KeepFiles && !config.UploadToS3 {
-		log.Fatal("cannot delete archives and also not upload to s3")
-	}
 
 	var level slog.Level
 	err := level.UnmarshalText([]byte(config.LogLevel))
@@ -96,13 +92,11 @@ func main() {
 		logger.Info("db ok", "state", "starting")
 	}
 
-	if config.UploadToS3 {
-		rt.S3, err = archives.NewS3Client(config)
-		if err != nil {
-			logger.Error("unable to initialize s3 client", "error", err)
-		} else {
-			logger.Info("s3 bucket ok", "state", "starting")
-		}
+	rt.S3, err = archives.NewS3Client(config, true)
+	if err != nil {
+		logger.Error("unable to initialize s3 client", "error", err)
+	} else {
+		logger.Info("s3 bucket ok", "state", "starting")
 	}
 
 	wg := &sync.WaitGroup{}

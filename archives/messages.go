@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/rp-archiver/runtime"
+	"github.com/vinovest/sqlx"
 )
 
 const (
@@ -20,12 +20,14 @@ const (
 const sqlLookupMsgs = `
 SELECT rec.visibility, row_to_json(rec) FROM (
 	SELECT
+		mm.uuid,
 		mm.id,
-		broadcast_id as broadcast,
-		row_to_json(contact) as contact,
+		broadcast_id AS broadcast,
+		row_to_json(contact) AS contact,
 		CASE WHEN oo.is_anon = FALSE THEN ccu.identity ELSE NULL END AS urn,
-		row_to_json(channel) as channel,
-		row_to_json(flow) as flow,
+		row_to_json(channel) AS channel,
+		row_to_json(flow) AS flow,
+		mm.ticket_uuid,
 		CASE WHEN direction = 'I' THEN 'in' WHEN direction = 'O' THEN 'out' ELSE NULL END AS direction,
 		CASE 
 			WHEN msg_type = 'T' THEN 'text'
@@ -48,18 +50,18 @@ SELECT rec.visibility, row_to_json(rec) FROM (
 		END AS status,
 		CASE WHEN visibility = 'V' THEN 'visible' WHEN visibility = 'A' THEN 'archived' WHEN visibility = 'D' THEN 'deleted' WHEN visibility = 'X' THEN 'deleted' ELSE NULL END as visibility,
 		text,
-		(select coalesce(jsonb_agg(attach_row), '[]'::jsonb) FROM (select attach_data.attachment[1] as content_type, attach_data.attachment[2] as url FROM (select regexp_matches(unnest(attachments), '^(.*?):(.*)$') attachment) as attach_data) as attach_row) as attachments,
-		labels_agg.data as labels,
-		mm.created_on as created_on,
-		sent_on,
-		mm.modified_on as modified_on
+		(SELECT coalesce(jsonb_agg(attach_row), '[]'::jsonb) FROM (SELECT attach_data.attachment[1] AS content_type, attach_data.attachment[2] AS url FROM (SELECT regexp_matches(unnest(attachments), '^(.*?):(.*)$') attachment) AS attach_data) AS attach_row) AS attachments,
+		labels_agg.data AS labels,
+		mm.created_on,
+		mm.sent_on,
+		mm.modified_on
 	FROM msgs_msg mm 
 		JOIN orgs_org oo ON mm.org_id = oo.id
-		JOIN LATERAL (select uuid, name from contacts_contact cc where cc.id = mm.contact_id) as contact ON True
+		JOIN LATERAL (SELECT uuid, name FROM contacts_contact cc WHERE cc.id = mm.contact_id) AS contact ON True
 		LEFT JOIN contacts_contacturn ccu ON mm.contact_urn_id = ccu.id
-		LEFT JOIN LATERAL (select uuid, name from channels_channel ch where ch.id = mm.channel_id) as channel ON True
-		LEFT JOIN LATERAL (select uuid, name from flows_flow f where f.id = mm.flow_id) as flow ON True
-		LEFT JOIN LATERAL (select coalesce(jsonb_agg(label_row), '[]'::jsonb) as data from (select uuid, name from msgs_label ml INNER JOIN msgs_msg_labels mml ON ml.id = mml.label_id AND mml.msg_id = mm.id) as label_row) as labels_agg ON True
+		LEFT JOIN LATERAL (SELECT uuid, name FROM channels_channel ch WHERE ch.id = mm.channel_id) AS channel ON True
+		LEFT JOIN LATERAL (SELECT uuid, name FROM flows_flow f WHERE f.id = mm.flow_id) AS flow ON True
+		LEFT JOIN LATERAL (SELECT coalesce(jsonb_agg(label_row), '[]'::jsonb) AS data FROM (SELECT uuid, name FROM msgs_label ml INNER JOIN msgs_msg_labels mml ON ml.id = mml.label_id AND mml.msg_id = mm.id) AS label_row) AS labels_agg ON True
 
 	WHERE mm.org_id = $1 AND mm.created_on >= $2 AND mm.created_on < $3
 ORDER BY created_on ASC, id ASC) rec;`
@@ -128,19 +130,23 @@ func DeleteArchivedMessages(ctx context.Context, rt *runtime.Runtime, archive *A
 	)
 	log.Info("deleting messages")
 
-	// first things first, make sure our file is correct on S3
-	s3Size, s3Hash, err := GetS3FileInfo(outer, rt.S3, archive.URL)
-	if err != nil {
-		return err
-	}
+	// only verify S3 file if archive was uploaded (non-empty archives)
+	if archive.isUploaded() {
+		// first things first, make sure our file is correct on S3
+		bucket, key := archive.location()
+		s3Size, s3Hash, err := GetS3FileInfo(outer, rt.S3, bucket, key)
+		if err != nil {
+			return err
+		}
 
-	if s3Size != archive.Size {
-		return fmt.Errorf("archive size: %d and s3 size: %d do not match", archive.Size, s3Size)
-	}
+		if s3Size != archive.Size {
+			return fmt.Errorf("archive size: %d and s3 size: %d do not match", archive.Size, s3Size)
+		}
 
-	// if S3 hash is MD5 then check against archive hash
-	if rt.Config.CheckS3Hashes && archive.Size <= maxSingleUploadBytes && s3Hash != archive.Hash {
-		return fmt.Errorf("archive md5: %s and s3 etag: %s do not match", archive.Hash, s3Hash)
+		// if S3 hash is MD5 then check against archive hash
+		if rt.Config.CheckS3Hashes && archive.Size <= maxSingleUploadBytes && s3Hash != string(archive.Hash) {
+			return fmt.Errorf("archive md5: %s and s3 etag: %s do not match", archive.Hash, s3Hash)
+		}
 	}
 
 	// ok, archive file looks good, let's build up our list of message ids, this may be big but we are int64s so shouldn't be too big
@@ -151,14 +157,15 @@ func DeleteArchivedMessages(ctx context.Context, rt *runtime.Runtime, archive *A
 	defer rows.Close()
 
 	visibleCount := 0
-	var msgID int64
-	var visibility string
 	msgIDs := make([]int64, 0, archive.RecordCount)
+
 	for rows.Next() {
-		err = rows.Scan(&msgID, &visibility)
-		if err != nil {
+		var msgID int64
+		var visibility string
+		if err := rows.Scan(&msgID, &visibility); err != nil {
 			return err
 		}
+
 		msgIDs = append(msgIDs, msgID)
 
 		// keep track of the number of visible messages, ie, not deleted
@@ -190,20 +197,17 @@ func DeleteArchivedMessages(ctx context.Context, rt *runtime.Runtime, archive *A
 		}
 
 		// first delete any labelings
-		err = executeInQuery(ctx, tx, sqlDeleteMessageLabels, idBatch)
-		if err != nil {
+		if err := executeInQuery(ctx, tx, sqlDeleteMessageLabels, idBatch); err != nil {
 			return fmt.Errorf("error removing message labels: %w", err)
 		}
 
 		// then delete the messages themselves
-		err = executeInQuery(ctx, tx, sqlDeleteMessages, idBatch)
-		if err != nil {
+		if err := executeInQuery(ctx, tx, sqlDeleteMessages, idBatch); err != nil {
 			return fmt.Errorf("error deleting messages: %w", err)
 		}
 
 		// commit our transaction
-		err = tx.Commit()
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("error committing message delete transaction: %w", err)
 		}
 
@@ -211,19 +215,6 @@ func DeleteArchivedMessages(ctx context.Context, rt *runtime.Runtime, archive *A
 
 		cancel()
 	}
-
-	outer, cancel = context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
-	deletedOn := dates.Now()
-
-	// all went well! mark our archive as no longer needing deletion
-	_, err = rt.DB.ExecContext(outer, sqlUpdateArchiveDeleted, archive.ID, deletedOn)
-	if err != nil {
-		return fmt.Errorf("error setting archive as deleted: %w", err)
-	}
-	archive.NeedsDeletion = false
-	archive.DeletedOn = &deletedOn
 
 	slog.Info("completed deleting messages", "elapsed", dates.Since(start))
 
@@ -298,8 +289,7 @@ func DeleteBroadcasts(ctx context.Context, rt *runtime.Runtime, now time.Time, o
 			return fmt.Errorf("error deleting broadcast: %d: %w", broadcastID, err)
 		}
 
-		err = tx.Commit()
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("error deleting broadcast: %d: %w", broadcastID, err)
 		}
 

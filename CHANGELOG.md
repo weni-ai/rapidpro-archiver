@@ -1,3 +1,63 @@
+v26.0.0 (2026-01-05)
+-------------------------
+ * Use 'purge' terminology for removal of archived records to avoid confusion with deletion of archives
+
+v10.3.11 (2025-12-16)
+-------------------------
+ * Delete rolled up and purged archives
+ * Use localstack for CI and local dev
+
+v10.3.10 (2025-12-03)
+-------------------------
+ * Update deps
+ * Don't set hash or size for empty archives
+
+v10.3.9 (2025-12-02)
+-------------------------
+ * Start writing Archive.uuid
+ * Don't upload empty archives to S3
+
+v10.3.8 (2025-12-01)
+-------------------------
+ * Remove another check on run status
+
+v10.3.7 (2025-12-01)
+-------------------------
+ * Remove delete config option
+ * Remove options to keep local temp files and not upload to S3
+
+v10.3.6 (2025-11-25)
+-------------------------
+ * Stop writing Archive.url field
+
+v10.3.5 (2025-11-24)
+-------------------------
+ * Remove run status check
+
+v10.3.4 (2025-11-24)
+-------------------------
+ * Start writing new archive.location field
+
+v10.3.3 (2025-11-20)
+-------------------------
+ * Update deps
+ * Include message UUIDs in archives
+
+v10.3.2 (2025-10-10)
+-------------------------
+ * Update dependencies
+ * Switch to vinovest/sqlx fork of jmoiron/sqlx
+
+v10.3.1 (2025-09-25)
+-------------------------
+ * Include msg.ticket_uuid
+
+v10.3.0 (2025-09-18)
+-------------------------
+ * Bump to go 1.25
+ * Update deps
+ * flowrun.path replaced by path_nodes and path_times
+
 v10.2.0 (2025-07-01)
 -------------------------
  * Update dependencies

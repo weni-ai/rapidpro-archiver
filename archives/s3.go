@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,10 +18,9 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	"github.com/aws/smithy-go/transport/http"
 	"github.com/nyaruka/gocommon/aws/s3x"
+	"github.com/nyaruka/null/v3"
 	"github.com/nyaruka/rp-archiver/runtime"
 )
-
-const s3BucketURL = "https://%s.s3.amazonaws.com/%s"
 
 // any file over this needs to be uploaded in chunks
 const maxSingleUploadBytes = 5e9 // 5GB
@@ -30,16 +29,17 @@ const maxSingleUploadBytes = 5e9 // 5GB
 const chunkSizeBytes = 1e9 // 1GB
 
 // NewS3Client creates a new s3 service from the passed in config, testing it as necessary
-func NewS3Client(cfg *runtime.Config) (*s3x.Service, error) {
-	svc, err := s3x.NewService(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, cfg.AWSRegion, cfg.S3Endpoint, cfg.S3Minio)
+func NewS3Client(cfg *runtime.Config, test bool) (*s3x.Service, error) {
+	svc, err := s3x.NewService(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, cfg.AWSRegion, cfg.S3Endpoint, cfg.S3PathStyle)
 	if err != nil {
 		return nil, err
 	}
 
-	// test out our S3 credentials
-	if err := svc.Test(context.TODO(), cfg.S3Bucket); err != nil {
-		slog.Error("s3 bucket not reachable", "error", err)
-		return nil, err
+	if test {
+		if err := svc.Test(context.TODO(), cfg.S3Bucket); err != nil {
+			slog.Error("s3 bucket not reachable", "error", err)
+			return nil, err
+		}
 	}
 
 	return svc, nil
@@ -53,10 +53,10 @@ func UploadToS3(ctx context.Context, s3Client *s3x.Service, bucket string, path 
 	}
 	defer f.Close()
 
-	url := fmt.Sprintf(s3BucketURL, bucket, path)
+	location := fmt.Sprintf("%s:%s", bucket, path)
 
 	// s3 wants a base64 encoded hash instead of our hex encoded
-	hashBytes, _ := hex.DecodeString(archive.Hash)
+	hashBytes, _ := hex.DecodeString(string(archive.Hash))
 	md5 := base64.StdEncoding.EncodeToString(hashBytes)
 
 	// if this fits into a single part, upload that way
@@ -92,13 +92,12 @@ func UploadToS3(ctx context.Context, s3Client *s3x.Service, bucket string, path 
 			ACL:             types.ObjectCannedACLPrivate,
 		}
 
-		_, err = uploader.Upload(ctx, params)
-		if err != nil {
+		if _, err := uploader.Upload(ctx, params); err != nil {
 			return err
 		}
 	}
 
-	archive.URL = url
+	archive.Location = null.String(location)
 	return nil
 }
 
@@ -111,15 +110,7 @@ func withAcceptEncoding(e string) func(o *s3.Options) {
 }
 
 // GetS3FileInfo returns the ETAG hash for the passed in file
-func GetS3FileInfo(ctx context.Context, s3Client *s3x.Service, fileURL string) (int64, string, error) {
-	u, err := url.Parse(fileURL)
-	if err != nil {
-		return 0, "", err
-	}
-
-	bucket := strings.Split(u.Host, ".")[0]
-	key := strings.TrimPrefix(u.Path, "/")
-
+func GetS3FileInfo(ctx context.Context, s3Client *s3x.Service, bucket, key string) (int64, string, error) {
 	head, err := s3Client.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
 	if err != nil {
 		return 0, "", fmt.Errorf("error looking up S3 object bucket=%s key=%s: %w", bucket, key, err)
@@ -136,15 +127,7 @@ func GetS3FileInfo(ctx context.Context, s3Client *s3x.Service, fileURL string) (
 }
 
 // GetS3File return an io.ReadCloser for the passed in bucket and path
-func GetS3File(ctx context.Context, s3Client *s3x.Service, fileURL string) (io.ReadCloser, error) {
-	u, err := url.Parse(fileURL)
-	if err != nil {
-		return nil, err
-	}
-
-	bucket := strings.Split(u.Host, ".")[0]
-	key := strings.TrimPrefix(u.Path, "/")
-
+func GetS3File(ctx context.Context, s3Client *s3x.Service, bucket, key string) (io.ReadCloser, error) {
 	output, err := s3Client.Client.GetObject(
 		ctx,
 		&s3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)},
@@ -155,4 +138,47 @@ func GetS3File(ctx context.Context, s3Client *s3x.Service, fileURL string) (io.R
 	}
 
 	return output.Body, nil
+}
+
+// DeleteS3Files deletes multiple files from S3, automatically batching into requests of 1000 keys
+func DeleteS3Files(ctx context.Context, s3Client *s3x.Service, bucket string, keys []string) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+
+	totalDeleted := 0
+	var lastErr error
+
+	for batch := range slices.Chunk(keys, 1000) {
+		objects := make([]types.ObjectIdentifier, len(batch))
+		for i, key := range batch {
+			objects[i] = types.ObjectIdentifier{Key: aws.String(key)}
+		}
+
+		output, err := s3Client.Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucket),
+			Delete: &types.Delete{Objects: objects, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			lastErr = fmt.Errorf("error batch deleting S3 objects bucket=%s: %w", bucket, err)
+			continue
+		}
+
+		// check for individual errors
+		if len(output.Errors) > 0 {
+			for _, e := range output.Errors {
+				slog.Error("error deleting S3 object in batch", "bucket", bucket, "key", *e.Key, "error", *e.Message)
+			}
+			totalDeleted += len(batch) - len(output.Errors)
+			lastErr = fmt.Errorf("%d errors deleting S3 objects", len(output.Errors))
+		} else {
+			totalDeleted += len(batch)
+		}
+	}
+
+	if totalDeleted > 0 {
+		slog.Debug("deleted S3 files", "bucket", bucket, "count", totalDeleted)
+	}
+
+	return totalDeleted, lastErr
 }
