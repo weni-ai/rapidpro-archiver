@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/jmoiron/sqlx"
 	"github.com/nyaruka/gocommon/dates"
 	"github.com/nyaruka/rp-archiver/runtime"
+	"github.com/vinovest/sqlx"
 )
 
 const (
@@ -22,11 +22,11 @@ const (
 )
 
 const sqlLookupRuns = `
-SELECT rec.uuid, rec.exited_on, row_to_json(rec)
+SELECT rec.uuid, row_to_json(rec)
 FROM (
 	SELECT
-		fr.id as id,
-		fr.uuid as uuid,
+		fr.id,
+		fr.uuid,
 		row_to_json(flow_struct) AS flow,
 		row_to_json(contact_struct) AS contact,
 		fr.responded,
@@ -37,18 +37,13 @@ FROM (
 				FROM (
 					SELECT node, time
 					FROM unnest(fr.path_nodes::text[] , fr.path_times::timestamptz[]) x(node, time) LIMIT 500)
-					as path_data)
-			ELSE (
-				SELECT coalesce(jsonb_agg(path_data), '[]'::jsonb)
-				FROM (
-					SELECT path_row ->> 'node_uuid' AS node, (path_row ->> 'arrived_on')::timestamptz as time
-					FROM jsonb_array_elements(fr.path::jsonb) AS path_row LIMIT 500)
-					as path_data)
-		END as path),
-		(SELECT coalesce(jsonb_object_agg(values_data.key, values_data.value), '{}'::jsonb) from (
+					AS path_data)
+			ELSE '[]'::jsonb
+		END AS path),
+		(SELECT coalesce(jsonb_object_agg(values_data.key, values_data.value), '{}'::jsonb) FROM (
 			SELECT key, jsonb_build_object('name', value -> 'name', 'value', value -> 'value', 'input', value -> 'input', 'time', (value -> 'created_on')::text::timestamptz, 'category', value -> 'category', 'node', value -> 'node_uuid') as value
 			FROM jsonb_each(fr.results::jsonb)) AS values_data
-		) as values,
+		) AS values,
 		fr.created_on,
 		fr.modified_on,
 		fr.exited_on,
@@ -58,7 +53,7 @@ FROM (
 			WHEN status = 'X' THEN 'expired'
 			WHEN status = 'F' THEN 'failed'
 			ELSE NULL
-		END as exit_type
+		END AS exit_type
 
 	FROM flows_flowrun fr
 	JOIN LATERAL (SELECT uuid, name FROM flows_flow WHERE flows_flow.id = fr.flow_id) AS flow_struct ON True
@@ -78,20 +73,12 @@ func writeRunRecords(ctx context.Context, db *sqlx.DB, archive *Archive, writer 
 
 	recordCount := 0
 
-	var runUUID string
-	var runExitedOn *time.Time
-	var record string
-
 	for rows.Next() {
-		err = rows.Scan(&runUUID, &runExitedOn, &record)
+		var runUUID string
+		var record string
 
-		if err != nil {
+		if err := rows.Scan(&runUUID, &record); err != nil {
 			return 0, fmt.Errorf("error scanning run record for org: %d: %w", archive.Org.ID, err)
-		}
-
-		// shouldn't be archiving an active run, that's an error
-		if runExitedOn == nil {
-			return 0, fmt.Errorf("run %s still active, cannot archive", runUUID)
 		}
 
 		writer.WriteString(record)
@@ -103,7 +90,7 @@ func writeRunRecords(ctx context.Context, db *sqlx.DB, archive *Archive, writer 
 }
 
 const sqlSelectOrgRunsInRange = `
-   SELECT fr.id, fr.status
+   SELECT fr.id
      FROM flows_flowrun fr
 LEFT JOIN contacts_contact cc ON cc.id = fr.contact_id
     WHERE fr.org_id = $1 AND fr.modified_on >= $2 AND fr.modified_on < $3
@@ -131,19 +118,23 @@ func DeleteArchivedRuns(ctx context.Context, rt *runtime.Runtime, archive *Archi
 	)
 	log.Info("deleting runs")
 
-	// first things first, make sure our file is correct on S3
-	s3Size, s3Hash, err := GetS3FileInfo(outer, rt.S3, archive.URL)
-	if err != nil {
-		return err
-	}
+	// only verify S3 file if archive was uploaded (non-empty archives)
+	if archive.isUploaded() {
+		// first things first, make sure our file is correct on S3
+		bucket, key := archive.location()
+		s3Size, s3Hash, err := GetS3FileInfo(outer, rt.S3, bucket, key)
+		if err != nil {
+			return err
+		}
 
-	if s3Size != archive.Size {
-		return fmt.Errorf("archive size: %d and s3 size: %d do not match", archive.Size, s3Size)
-	}
+		if s3Size != archive.Size {
+			return fmt.Errorf("archive size: %d and s3 size: %d do not match", archive.Size, s3Size)
+		}
 
-	// if S3 hash is MD5 then check against archive hash
-	if rt.Config.CheckS3Hashes && archive.Size <= maxSingleUploadBytes && s3Hash != archive.Hash {
-		return fmt.Errorf("archive md5: %s and s3 etag: %s do not match", archive.Hash, s3Hash)
+		// if S3 hash is MD5 then check against archive hash
+		if rt.Config.CheckS3Hashes && archive.Size <= maxSingleUploadBytes && s3Hash != string(archive.Hash) {
+			return fmt.Errorf("archive md5: %s and s3 etag: %s do not match", archive.Hash, s3Hash)
+		}
 	}
 
 	// ok, archive file looks good, let's build up our list of run ids, this may be big but we are int64s so shouldn't be too big
@@ -154,22 +145,11 @@ func DeleteArchivedRuns(ctx context.Context, rt *runtime.Runtime, archive *Archi
 	defer rows.Close()
 
 	var runID int64
-	var status string
-	runCount := 0
 	runIDs := make([]int64, 0, archive.RecordCount)
 	for rows.Next() {
-		err = rows.Scan(&runID, &status)
-		if err != nil {
+		if err := rows.Scan(&runID); err != nil {
 			return err
 		}
-
-		// if this run is still active, something has gone wrong, throw an error
-		if status == RunStatusActive || status == RunStatusWaiting {
-			return fmt.Errorf("run #%d in archive hadn't exited", runID)
-		}
-
-		// increment our count
-		runCount++
 		runIDs = append(runIDs, runID)
 	}
 	rows.Close()
@@ -177,8 +157,8 @@ func DeleteArchivedRuns(ctx context.Context, rt *runtime.Runtime, archive *Archi
 	log.Debug("found runs", "run_count", len(runIDs))
 
 	// verify we don't see more runs than there are in our archive (fewer is ok)
-	if runCount > archive.RecordCount {
-		return fmt.Errorf("more runs in the database: %d than in archive: %d", runCount, archive.RecordCount)
+	if len(runIDs) > archive.RecordCount {
+		return fmt.Errorf("more runs in the database: %d than in archive: %d", len(runIDs), archive.RecordCount)
 	}
 
 	// ok, delete our runs in batches, we do this in transactions as it spans a few different queries
@@ -196,14 +176,12 @@ func DeleteArchivedRuns(ctx context.Context, rt *runtime.Runtime, archive *Archi
 		}
 
 		// delete our runs
-		err = executeInQuery(ctx, tx, sqlDeleteRuns, idBatch)
-		if err != nil {
+		if err := executeInQuery(ctx, tx, sqlDeleteRuns, idBatch); err != nil {
 			return fmt.Errorf("error deleting runs: %w", err)
 		}
 
 		// commit our transaction
-		err = tx.Commit()
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("error committing run delete transaction: %w", err)
 		}
 
@@ -211,19 +189,6 @@ func DeleteArchivedRuns(ctx context.Context, rt *runtime.Runtime, archive *Archi
 
 		cancel()
 	}
-
-	outer, cancel = context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
-	deletedOn := dates.Now()
-
-	// all went well! mark our archive as no longer needing deletion
-	_, err = rt.DB.ExecContext(outer, sqlUpdateArchiveDeleted, archive.ID, deletedOn)
-	if err != nil {
-		return fmt.Errorf("error setting archive as deleted: %w", err)
-	}
-	archive.NeedsDeletion = false
-	archive.DeletedOn = &deletedOn
 
 	slog.Info("completed deleting runs", "elapsed", dates.Since(start))
 
@@ -297,8 +262,7 @@ func DeleteFlowStarts(ctx context.Context, rt *runtime.Runtime, now time.Time, o
 			return fmt.Errorf("error deleting start: %d: %w", startID, err)
 		}
 
-		err = tx.Commit()
-		if err != nil {
+		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("error deleting start: %d: %w", startID, err)
 		}
 
