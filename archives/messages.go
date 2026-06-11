@@ -28,7 +28,7 @@ SELECT rec.visibility, row_to_json(rec) FROM (
 		row_to_json(channel) as channel,
 		row_to_json(flow) as flow,
 		CASE WHEN direction = 'I' THEN 'in' WHEN direction = 'O' THEN 'out' ELSE NULL END AS direction,
-		CASE WHEN msg_type = 'F' THEN 'flow' WHEN msg_type = 'V' THEN 'ivr' WHEN msg_type = 'I' THEN 'inbox' ELSE NULL END AS "type",
+		CASE WHEN msg_type = 'V' THEN 'voice' ELSE 'text' END AS "type",
 		CASE 
 			WHEN status = 'I' THEN 'initializing'
 			WHEN status = 'P' THEN 'queued'
@@ -40,8 +40,8 @@ SELECT rec.visibility, row_to_json(rec) FROM (
 			WHEN status = 'F' THEN 'failed'
 			WHEN status = 'S' THEN 'sent'
 			WHEN status = 'R' THEN 'resent'
-		ELSE NULL
-		END as status,
+			ELSE NULL 
+		END AS status,
 		CASE WHEN visibility = 'V' THEN 'visible' WHEN visibility = 'A' THEN 'archived' WHEN visibility = 'D' THEN 'deleted' WHEN visibility = 'X' THEN 'deleted' ELSE NULL END as visibility,
 		text,
 		(select coalesce(jsonb_agg(attach_row), '[]'::jsonb) FROM (select attach_data.attachment[1] as content_type, attach_data.attachment[2] as url FROM (select regexp_matches(unnest(attachments), '^(.*?):(.*)$') attachment) as attach_data) as attach_row) as attachments,
@@ -98,9 +98,6 @@ const sqlSelectOrgMessagesInRange = `
 LEFT JOIN contacts_contact cc ON cc.id = mm.contact_id
     WHERE mm.org_id = $1 AND mm.created_on >= $2 AND mm.created_on < $3
  ORDER BY mm.created_on ASC, mm.id ASC`
-
-const sqlDeleteChannelLogs = `
-DELETE FROM channels_channellog WHERE msg_id IN(?)`
 
 const sqlDeleteMessageLabels = `
 DELETE FROM msgs_msg_labels WHERE msg_id IN(?)`
@@ -184,19 +181,13 @@ func DeleteArchivedMessages(ctx context.Context, config *Config, db *sqlx.DB, s3
 			return err
 		}
 
-		// first delete any channel logs
-		err = executeInQuery(ctx, tx, sqlDeleteChannelLogs, idBatch)
-		if err != nil {
-			return errors.Wrap(err, "error removing channel logs")
-		}
-
-		// then any labels
+		// first delete any labelings
 		err = executeInQuery(ctx, tx, sqlDeleteMessageLabels, idBatch)
 		if err != nil {
 			return errors.Wrap(err, "error removing message labels")
 		}
 
-		// finally, delete our messages
+		// then delete the messages themselves
 		err = executeInQuery(ctx, tx, sqlDeleteMessages, idBatch)
 		if err != nil {
 			return errors.Wrap(err, "error deleting messages")
@@ -219,7 +210,7 @@ func DeleteArchivedMessages(ctx context.Context, config *Config, db *sqlx.DB, s3
 	deletedOn := dates.Now()
 
 	// all went well! mark our archive as no longer needing deletion
-	_, err = db.ExecContext(outer, setArchiveDeleted, archive.ID, deletedOn)
+	_, err = db.ExecContext(outer, sqlUpdateArchiveDeleted, archive.ID, deletedOn)
 	if err != nil {
 		return errors.Wrap(err, "error setting archive as deleted")
 	}
@@ -282,13 +273,6 @@ func DeleteBroadcasts(ctx context.Context, now time.Time, config *Config, db *sq
 		if err != nil {
 			tx.Rollback()
 			return errors.Wrapf(err, "error deleting related groups for broadcast: %d", broadcastID)
-		}
-
-		// delete URNs M2M
-		_, err = tx.Exec(`DELETE from msgs_broadcast_urns WHERE broadcast_id = $1`, broadcastID)
-		if err != nil {
-			tx.Rollback()
-			return errors.Wrapf(err, "error deleting related urns for broadcast: %d", broadcastID)
 		}
 
 		// delete counts associated with this broadcast
