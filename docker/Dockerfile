@@ -1,9 +1,9 @@
-FROM golang:1.19-alpine3.17
+FROM golang:1.21-alpine3.19
 
 WORKDIR /app
 
 RUN apk update \
-  && apk add --virtual build-deps gcc git \
+  && apk add --no-cache --virtual build-deps build-base git postgresql-dev \
   && rm -rf /var/cache/apk/*
 
 RUN addgroup -S golang \
